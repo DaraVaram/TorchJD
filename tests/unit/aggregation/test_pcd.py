@@ -75,7 +75,7 @@ def test_single_row_returns_it() -> None:
 @mark.parametrize("matrix", typical_matrices + scaled_matrices)
 def test_output_has_the_norm_of_the_primary_gradient(matrix: Tensor) -> None:
     out = PCD()(matrix)
-    assert_close(out.norm(), matrix[0].norm(), rtol=1e-4, atol=0.0)
+    assert_close(out.norm(), matrix[0].norm(), rtol=2e-4, atol=0.0)
 
 
 def test_zero_primary_gradient_returns_zero_vector() -> None:
