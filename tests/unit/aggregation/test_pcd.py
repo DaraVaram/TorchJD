@@ -176,6 +176,22 @@ def test_changing_m_auto_resets() -> None:
     assert_close(A(J), PCD()(J))
 
 
+@mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_non_finite_input_returns_nan_and_keeps_state(value: float) -> None:
+    J = randn_((3, 8))
+    J_non_finite = J.clone()
+    J_non_finite[1, 2] = value
+
+    A = PCD()
+    A(J)
+    assert A(J_non_finite).isnan().all()
+
+    # The non-finite call must not have changed the moving average.
+    reference = PCD()
+    reference(J)
+    assert_close(A(J), reference(J))
+
+
 def test_aggregator_and_weighting_agree() -> None:
     A = PCD(tau=0.1)
     W = PCDWeighting(tau=0.1)

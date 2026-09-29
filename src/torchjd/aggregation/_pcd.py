@@ -46,6 +46,7 @@ class PCDWeighting(_GramianWeighting, Stateful, _NonDifferentiable):
         self.eps = eps
         self.register_buffer("_sq_norm_ema", None)
         self.register_buffer("_n_steps", None)
+        self._state_key: int | None = None
 
     @property
     def tau(self) -> float | Tensor:
@@ -91,6 +92,7 @@ class PCDWeighting(_GramianWeighting, Stateful, _NonDifferentiable):
 
         self._sq_norm_ema = None
         self._n_steps = None
+        self._state_key = None
 
     def forward(self, gramian: PSDMatrix, /) -> Tensor:
         # The problem only has size m x m, so we solve it on cpu and in float64.
@@ -101,6 +103,10 @@ class PCDWeighting(_GramianWeighting, Stateful, _NonDifferentiable):
             return weights.to(device=gramian.device, dtype=gramian.dtype)
 
         taus = self._get_taus(m)
+        if not G.isfinite().all():
+            # Let nan and inf propagate to the output, without corrupting the moving average.
+            return torch.full_like(gramian.diagonal(), torch.nan)
+
         sq_norms = G.diagonal()
         scales = self._update_scales(sq_norms)
 
@@ -131,11 +137,7 @@ class PCDWeighting(_GramianWeighting, Stateful, _NonDifferentiable):
         the scale by which each gradient should be multiplied to be normalized.
         """
 
-        m = sq_norms.shape[0]
-        if self._sq_norm_ema is None or self._sq_norm_ema.shape[0] != m:
-            self._sq_norm_ema = torch.zeros(m, dtype=torch.float64)
-            self._n_steps = torch.tensor(0)
-
+        self._ensure_state(sq_norms.shape[0])
         sq_norm_ema = self._sq_norm_ema.to(sq_norms)
         n_steps = int(cast(Tensor, self._n_steps)) + 1
         sq_norm_ema = self.beta * sq_norm_ema + (1.0 - self.beta) * sq_norms
@@ -144,6 +146,14 @@ class PCDWeighting(_GramianWeighting, Stateful, _NonDifferentiable):
 
         debiased_sq_norm_ema = sq_norm_ema / (1.0 - self.beta**n_steps)
         return 1.0 / (debiased_sq_norm_ema + self.eps).sqrt()
+
+    def _ensure_state(self, m: int) -> None:
+        # The moving average is always kept on cpu and in float64, where the weights are computed,
+        # so it only depends on the number of objectives.
+        if self._state_key != m or self._sq_norm_ema is None:
+            self._sq_norm_ema = torch.zeros(m, dtype=torch.float64)
+            self._n_steps = torch.tensor(0)
+            self._state_key = m
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(tau={self.tau!r}, beta={self.beta!r}, eps={self.eps!r})"
@@ -169,11 +179,17 @@ class PCD(GramianWeightedAggregator, Stateful, _NonDifferentiable):
         \quad \text{subject to} \quad \tilde g_j^\top d \geq \tau \left\| \tilde g_j \right\|^2
         \quad \text{for } j = 2, \dots, m,
 
-    where :math:`\tilde g_i = s_i g_i` is the normalized gradient of objective :math:`i`, with
-    :math:`s_i = 1 / \sqrt{\hat v_i + \epsilon}`, and :math:`\hat v_i` is the bias-corrected
-    exponential moving average, over the successive calls, of :math:`\|g_i\|^2`. The output is
-    :math:`\tilde d` rescaled to the norm of :math:`g_1`. Because of the normalization, :math:`\tau`
-    is a scale-free fraction.
+    where:
+
+    - :math:`\tilde g_i = s_i g_i` is the normalized gradient of objective :math:`i`,
+    - :math:`s_i = 1 / \sqrt{\hat v_i + \epsilon}` is its scale,
+    - :math:`\hat v_i` is the bias-corrected exponential moving average of :math:`\|g_i\|^2` over
+      the successive calls, with decay :math:`\beta`.
+
+    The output is :math:`\tilde d` rescaled to the norm of :math:`g_1`. Because of the
+    normalization, :math:`\tau` is a scale-free fraction: multiplying a secondary row of the input
+    by the same positive constant at every call leaves the output unchanged, up to the effect of
+    :math:`\epsilon`.
 
     Special cases:
 
@@ -181,6 +197,8 @@ class PCD(GramianWeightedAggregator, Stateful, _NonDifferentiable):
     - If the constraints cannot be satisfied simultaneously (which requires :math:`m \geq 3`, e.g.
       two anti-parallel secondary gradients), they are dropped and the output is :math:`g_1`.
     - If :math:`\tilde d = 0`, the output is zero.
+    - If the input contains ``nan`` or ``inf``, the output is ``nan`` and the moving average is left
+      unchanged.
 
     :param tau: The fraction :math:`\tau \in [0, 1]` of normalized first-order progress guaranteed
         to each secondary objective. Either a float, shared by all secondary objectives, or a vector
