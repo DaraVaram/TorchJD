@@ -138,7 +138,7 @@ class PCDWeighting(_GramianWeighting, Stateful, _NonDifferentiable):
         """
 
         self._ensure_state(sq_norms.shape[0])
-        sq_norm_ema = self._sq_norm_ema.to(sq_norms)
+        sq_norm_ema = cast(Tensor, self._sq_norm_ema).to(sq_norms)
         n_steps = int(cast(Tensor, self._n_steps)) + 1
         sq_norm_ema = self.beta * sq_norm_ema + (1.0 - self.beta) * sq_norms
         self._sq_norm_ema = sq_norm_ema
