@@ -110,14 +110,22 @@ class PCDWeighting(_GramianWeighting, Stateful, _NonDifferentiable):
         sq_norms = G.diagonal()
         scales = self._update_scales(sq_norms)
 
+        # Relative precision of the Gramian. Below it, the solver treats gradients as linearly
+        # dependent, and the direction as zero.
+        precision = 10.0 * torch.finfo(gramian.dtype).eps
+
         # If the gradient of the primary objective is zero, the update is zero.
         if sq_norms[0] > 0.0:
             normalized_G = G * torch.outer(scales, scales)
-            coefficients = _solve_qp(normalized_G, taus) * scales
-            direction_sq_norm = coefficients @ G @ coefficients
-            # Rescale the direction to the norm of the primary gradient.
-            if direction_sq_norm > 0.0:
-                weights = coefficients * (sq_norms[0] / direction_sq_norm).sqrt()
+            w = _solve_qp(normalized_G, taus, dependence_tol=max(1e-9, precision))
+            # Squared norm of d~ = sum_i w_i s_i g_i, and the scale of its rounding error when it is
+            # computed from the Gramian.
+            direction_sq_norm = w @ normalized_G @ w
+            magnitude = (w.abs() @ normalized_G.diagonal().sqrt()) ** 2
+            # Rescale the direction to the norm of the primary gradient, unless it is zero up to
+            # rounding errors.
+            if direction_sq_norm > precision * magnitude:
+                weights = w * scales * (sq_norms[0] / direction_sq_norm).sqrt()
 
         return weights.to(device=gramian.device, dtype=gramian.dtype)
 
@@ -145,7 +153,10 @@ class PCDWeighting(_GramianWeighting, Stateful, _NonDifferentiable):
         self._n_steps = torch.tensor(n_steps)
 
         debiased_sq_norm_ema = sq_norm_ema / (1.0 - self.beta**n_steps)
-        return 1.0 / (debiased_sq_norm_ema + self.eps).sqrt()
+        denominators = (debiased_sq_norm_ema + self.eps).sqrt()
+        # A zero moving average means that the gradient has always been zero, so its scale does not
+        # matter. Using 0 avoids dividing by zero when eps = 0.
+        return torch.where(denominators > 0.0, 1.0 / denominators, 0.0)
 
     def _ensure_state(self, m: int) -> None:
         # The moving average is always kept on cpu and in float64, where the weights are computed,
@@ -196,7 +207,7 @@ class PCD(GramianWeightedAggregator, Stateful, _NonDifferentiable):
     - If :math:`g_1 = 0`, the output is zero.
     - If the constraints cannot be satisfied simultaneously (which requires :math:`m \geq 3`, e.g.
       two anti-parallel secondary gradients), they are dropped and the output is :math:`g_1`.
-    - If :math:`\tilde d = 0`, the output is zero.
+    - If :math:`\tilde d = 0`, up to the rounding errors of the Gramian, the output is zero.
     - If the input contains ``nan`` or ``inf``, the output is ``nan`` and the moving average is left
       unchanged.
 
@@ -261,7 +272,13 @@ class PCD(GramianWeightedAggregator, Stateful, _NonDifferentiable):
         return f"{self.__class__.__name__}(tau={self.tau!r}, beta={self.beta!r}, eps={self.eps!r})"
 
 
-def _solve_qp(G: Tensor, taus: Tensor, tol: float = 1e-9) -> Tensor:
+def _solve_qp(
+    G: Tensor,
+    taus: Tensor,
+    tol: float = 1e-9,
+    dependence_tol: float = 1e-9,
+    max_iters: int | None = None,
+) -> Tensor:
     r"""
     Solves the quadratic program of PCD, given the Gramian :math:`G` of the (normalized) gradients
     :math:`g_1, \dots, g_m`, whose first row and column correspond to the primary objective:
@@ -278,6 +295,18 @@ def _solve_qp(G: Tensor, taus: Tensor, tol: float = 1e-9) -> Tensor:
     This is the dual active-set method of Goldfarb and Idnani (1983), for an identity Hessian. The
     stationarity condition :math:`d = g_1 + \sum_j \mu_j g_j` holds at every iteration, so that all
     the required inner products can be read from :math:`G`.
+
+    A constraint counts as satisfied when it is violated by at most ``tol`` times the largest
+    diagonal entry of :math:`G`. A gradient counts as a linear combination of the gradients of the
+    active constraints when its component orthogonal to them has a squared norm of at most
+    ``dependence_tol`` times its own. The latter should be above the relative precision of
+    :math:`G`, or rounding errors can make dependent gradients look independent, with huge
+    multipliers.
+
+    Each iteration adds or drops one constraint. In exact arithmetic, the method terminates after
+    finitely many iterations (about :math:`m` in practice). ``max_iters`` (by default :math:`10 m`)
+    only guards against cycling caused by rounding errors: when it is reached, the current iterate
+    is returned.
     """
 
     m = G.shape[0]
@@ -286,23 +315,27 @@ def _solve_qp(G: Tensor, taus: Tensor, tol: float = 1e-9) -> Tensor:
     if m == 1:
         return weights
 
+    if max_iters is None:
+        max_iters = 10 * m
     Gs = G[1:, 1:]
     b = taus * Gs.diagonal() - G[1:, 0]  # b_j > 0 iff g_1 violates the constraint of objective j
     mu = torch.zeros(m - 1, dtype=G.dtype)
     atol = tol * max(G.diagonal().max().item(), torch.finfo(G.dtype).tiny)
     active: list[int] = []
+    n_iters = 0
 
-    while True:
+    while n_iters < max_iters:
         slacks = Gs @ mu - b
         slacks[active] = 0.0  # The active constraints hold with equality, up to rounding errors.
         p = int(slacks.argmin())
         if slacks[p] >= -atol:
-            weights[1:] = mu.clamp(min=0.0)
-            return weights
+            break
 
         # Add the violated constraint p to the active set, possibly dropping some others first.
         slack_p = slacks[p]
-        while True:
+        while n_iters < max_iters:
+            n_iters += 1
+
             # In the dual space, the step direction is +1 for mu_p and -r for the active mu_j.
             # In the primal space, it is z = g_p - sum_j r_j g_j, the component of g_p orthogonal to
             # the gradients of the active constraints.
@@ -320,7 +353,7 @@ def _solve_qp(G: Tensor, taus: Tensor, tol: float = 1e-9) -> Tensor:
 
             # If z = 0, g_p is a linear combination of the active gradients and no primal step is
             # possible.
-            is_z_non_zero = z_sq_norm > tol * Gs[p, p]
+            is_z_non_zero = z_sq_norm > dependence_tol * Gs[p, p]
             full_step = (-slack_p / z_sq_norm).item() if is_z_non_zero else torch.inf
 
             step = min(partial_step, full_step)
@@ -337,3 +370,6 @@ def _solve_qp(G: Tensor, taus: Tensor, tol: float = 1e-9) -> Tensor:
             mu[active[k]] = 0.0
             del active[k]
             slack_p = Gs[p] @ mu - b[p]
+
+    weights[1:] = mu.clamp(min=0.0)
+    return weights

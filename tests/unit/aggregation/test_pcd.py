@@ -8,7 +8,12 @@ from torchjd.aggregation import PCD, PCDWeighting
 from torchjd.aggregation._pcd import _solve_qp
 
 from ._asserts import assert_expected_structure, assert_non_differentiable
-from ._inputs import scaled_matrices, typical_matrices, typical_matrices_2_plus_rows
+from ._inputs import (
+    scaled_matrices,
+    scaled_matrices_2_plus_rows,
+    typical_matrices,
+    typical_matrices_2_plus_rows,
+)
 
 scaled_pairs = [(PCD(), m) for m in scaled_matrices]
 typical_pairs = [(PCD(), m) for m in typical_matrices]
@@ -21,10 +26,16 @@ def _two_objectives_pcd(matrix: Tensor, tau: float, scales: Tensor) -> Tensor:
     derive expected values independently of the implementation.
     """
 
-    g1, g2 = matrix[0] * scales[0], matrix[1] * scales[1]
-    mu = ((tau * (g2 @ g2) - g1 @ g2) / (g2 @ g2)).clamp(min=0.0)
+    matrix64, scales64 = matrix.to(dtype=torch.float64), scales.to(dtype=torch.float64)
+    g1, g2 = matrix64[0] * scales64[0], matrix64[1] * scales64[1]
+    sq_norm_2 = g2 @ g2
+    mu = ((tau * sq_norm_2 - g1 @ g2) / sq_norm_2).clamp(min=0.0) if sq_norm_2 > 0.0 else 0.0
     direction = g1 + mu * g2
-    return direction * matrix[0].norm() / direction.norm()
+    # The direction vanishes when the primary gradient is zero, or when tau = 0 and the secondary
+    # gradient is opposite to it. Up to rounding errors, it is then zero.
+    if direction.norm() <= 1e-6 * (g1.norm() + mu * g2.norm()):
+        return torch.zeros_like(matrix[0])
+    return (direction * matrix64[0].norm() / direction.norm()).to(dtype=matrix.dtype)
 
 
 @mark.parametrize(["aggregator", "matrix"], scaled_pairs + typical_pairs)
@@ -61,11 +72,10 @@ def test_single_row_returns_it() -> None:
     assert_close(PCD()(J), J[0])
 
 
-@mark.parametrize("shape", [(2, 5), (3, 5), (5, 10), (9, 11)])
-def test_output_has_the_norm_of_the_primary_gradient(shape: tuple[int, int]) -> None:
-    J = randn_(shape) * randn_((shape[0], 1)).exp()
-    out = PCD()(J)
-    assert_close(out.norm(), J[0].norm())
+@mark.parametrize("matrix", typical_matrices + scaled_matrices)
+def test_output_has_the_norm_of_the_primary_gradient(matrix: Tensor) -> None:
+    out = PCD()(matrix)
+    assert_close(out.norm(), matrix[0].norm(), rtol=1e-4, atol=0.0)
 
 
 def test_zero_primary_gradient_returns_zero_vector() -> None:
@@ -92,11 +102,17 @@ def test_primary_objective_is_sacrificed_for_an_opposed_secondary_objective() ->
     assert_close(PCD(tau=0.02)(J), tensor_([-1.0, 0.0]))
 
 
+@mark.parametrize("matrix", typical_matrices_2_plus_rows + scaled_matrices_2_plus_rows)
 @mark.parametrize("tau", [0.0, 0.02, 0.5, 1.0])
-def test_two_objectives_matches_closed_form(tau: float) -> None:
-    J = randn_((2, 6))
-    scales = 1.0 / J.norm(dim=1)
-    assert_close(PCD(tau=tau, eps=0.0)(J), _two_objectives_pcd(J, tau, scales))
+def test_two_objectives_matches_closed_form(matrix: Tensor, tau: float) -> None:
+    J = matrix[:2]
+    eps = 1e-8
+    scales = 1.0 / (J.norm(dim=1) ** 2 + eps).sqrt()
+    # The tolerance is relative to the norm of the output, so that it also applies to scaled matrices.
+    atol = 1e-4 * max(1.0, J[0].norm().item())
+    assert_close(
+        PCD(tau=tau, eps=eps)(J), _two_objectives_pcd(J, tau, scales), rtol=1e-4, atol=atol
+    )
 
 
 def test_second_call_uses_debiased_moving_average() -> None:
@@ -137,6 +153,27 @@ def test_solve_qp_satisfies_kkt_conditions(m: int, tau: float) -> None:
     assert (mu >= 0.0).all()
     assert (slacks >= -1e-8).all()
     assert_close(mu * slacks, torch.zeros_like(mu), rtol=0.0, atol=1e-8)
+
+
+def test_solve_qp_stops_after_max_iters() -> None:
+    # g_1 violates both constraints, and adding the first one to the active set is not enough, so the
+    # solver needs two iterations.
+    J = tensor_([[1.0, 0.0], [-1.0, 1.0], [-1.0, -1.0]]).to(device="cpu", dtype=torch.float64)
+    G = J @ J.T
+    taus = torch.full([2], 0.5, dtype=torch.float64)
+
+    weights = _solve_qp(G, taus)
+    assert (weights[1:] > 0.0).all()
+
+    truncated_weights = _solve_qp(G, taus, max_iters=1)
+    assert truncated_weights[0] == 1.0
+    assert (truncated_weights[1:] > 0.0).sum() == 1
+
+
+def test_zero_secondary_gradient_with_zero_eps() -> None:
+    # The moving average of the second row is zero, so its scale must not become 1 / 0.
+    J = tensor_([[1.0, 2.0], [0.0, 0.0], [3.0, -1.0]])
+    assert_close(PCD(eps=0.0)(J), J[0])
 
 
 def test_vector_tau_with_equal_values_matches_scalar_tau() -> None:
